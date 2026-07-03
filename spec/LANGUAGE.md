@@ -125,6 +125,13 @@ The transpiler tracks active code blocks using a local label stack to resolve co
 1.  **On matching `if`**: Emits an inverse condition jump instruction targeting a unique sequential label (`jne .L_ELSE_0`). Pushes tracking pointers to the compiler stack framework.
 2.  **On matching `else`**: Emits an unconditional branch escape (`jmp .L_END_0`), outputs the active label identifier (`.L_ELSE_0:`), and updates the stack tracking state.
 3.  **On matching the closing brace `}`**: Pops the remaining active label identifier from the internal tracking stack and prints it to the output file (`.L_END_0:`).
+## 5.3 Single-Pass Loops (`loop`)
+Loops execute a block of code repeatedly while a strict, flat conditional expression is true. The loop condition uses a single comparison operator: `==`, `!=`, `<`, or `>`.
+
+loop rax < 10 {
+    ; Loop body logic here
+    rax = rax + 1
+}
 
 ---
 
