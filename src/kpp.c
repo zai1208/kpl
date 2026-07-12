@@ -5,7 +5,13 @@
  *
  *   - Flattens INCLUDE "file" directives into a single line stream,
  *     silently skipping any file that has already been visited so that
- *     cyclic/diamond includes can't cause infinite recursion.
+ *     cyclic/diamond includes can't cause infinite recursion. Each
+ *     INCLUDE is resolved relative to the including file's own directory
+ *     first (like C's #include "..."), then against any -I roots given
+ *     on the command line (like C's -I search path) - this is what lets
+ *     a deep tree (e.g. kstd/arch/x86_64/vmm.kpl including
+ *     kstd/mem/pmm.kpl) write INCLUDE paths as project-root-relative
+ *     strings instead of a pile of fragile "../../..".
  *   - Indexes every PROC and STRUCT block found in the flattened stream.
  *   - Walks the call graph starting from `kpl_main` (the conventional
  *     kernel entry point - see spec/COMPILER.md 4.1, ENTRY(kpl_main)) and
@@ -110,6 +116,16 @@ static int starts_with_word(const char *p, const char *kw) {
     return !is_ident_char((unsigned char)p[n]);
 }
 
+static void die(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "kpp: error: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    exit(1);
+}
+
 /* Resolves an INCLUDE "path" relative to the directory of the file that
  * contains the directive (mirroring C's #include semantics), so a project
  * can be built from any cwd as long as the root file's own path is
@@ -134,14 +150,55 @@ static void resolve_include_path(const char *base_file, const char *inc_path, ch
     out[dirlen + remain - 1] = '\0';
 }
 
-static void die(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    fprintf(stderr, "kpp: error: ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    va_end(ap);
-    exit(1);
+static int file_exists(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+/* -I search roots (see -I in main()), tried in gcc/cpp order: relative to
+ * the including file first, then each -I root in the order given. This is
+ * what lets deeply-nested trees (kstd/arch/x86_64/... including
+ * kstd/mem/...) write project-root-relative INCLUDE paths instead of a
+ * pile of "../../.." that breaks the moment a file moves. */
+#define MAX_INCLUDE_ROOTS 64
+static char g_include_roots[MAX_INCLUDE_ROOTS][MAX_PATH_LEN];
+static int  g_include_root_count = 0;
+
+/* Finds the real, openable path for an INCLUDE "inc_path" referenced from
+ * within `base_file`, trying (in order): absolute-as-is, relative to
+ * base_file's directory, then each -I root joined with inc_path. Dies
+ * with every candidate listed if none exist. */
+static void find_include(const char *base_file, const char *inc_path, char *out, size_t outsz) {
+    if (inc_path[0] == '/') {
+        strncpy(out, inc_path, outsz - 1);
+        out[outsz - 1] = '\0';
+        if (!file_exists(out)) die("cannot open '%s'", out);
+        return;
+    }
+
+    char tried[4096];
+    size_t tn = 0;
+    tn += (size_t)snprintf(tried + tn, sizeof(tried) - tn, "  ");
+
+    resolve_include_path(base_file, inc_path, out, outsz);
+    tn += (size_t)snprintf(tried + tn, sizeof(tried) - tn, "%s", out);
+    if (file_exists(out)) return;
+
+    int i;
+    for (i = 0; i < g_include_root_count; i++) {
+        char candidate[MAX_PATH_LEN];
+        snprintf(candidate, sizeof candidate, "%s/%s", g_include_roots[i], inc_path);
+        if (tn < sizeof(tried) - 4) tn += (size_t)snprintf(tried + tn, sizeof(tried) - tn, ", %s", candidate);
+        if (file_exists(candidate)) {
+            strncpy(out, candidate, outsz - 1);
+            out[outsz - 1] = '\0';
+            return;
+        }
+    }
+
+    die("cannot find '%s' (tried:%s)", inc_path, tried);
 }
 
 /* Copies `in` into `out` truncated at the first top-level comment
@@ -189,7 +246,7 @@ static void flatten(const char *filename) {
             if (*q != '"') die("%s:%d: unterminated string in INCLUDE directive", filename, lineno);
             path[k] = '\0';
             char resolved[MAX_PATH_LEN];
-            resolve_include_path(filename, path, resolved, sizeof resolved);
+            find_include(filename, path, resolved, sizeof resolved);
             flatten(resolved); /* recurse; our own `f`/lineno state is untouched */
             continue;
         }
@@ -402,11 +459,33 @@ static void emit_output(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: kpp <root.kpl>\n");
+    const char *root = NULL;
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "-I", 2) == 0 && argv[i][2] != '\0') {
+            /* -Idir (attached form) */
+            if (g_include_root_count >= MAX_INCLUDE_ROOTS) die("too many -I include roots (limit %d)", MAX_INCLUDE_ROOTS);
+            strncpy(g_include_roots[g_include_root_count], argv[i] + 2, MAX_PATH_LEN - 1);
+            g_include_roots[g_include_root_count][MAX_PATH_LEN - 1] = '\0';
+            g_include_root_count++;
+        } else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) {
+            /* -I dir (space-separated form) */
+            if (g_include_root_count >= MAX_INCLUDE_ROOTS) die("too many -I include roots (limit %d)", MAX_INCLUDE_ROOTS);
+            strncpy(g_include_roots[g_include_root_count], argv[++i], MAX_PATH_LEN - 1);
+            g_include_roots[g_include_root_count][MAX_PATH_LEN - 1] = '\0';
+            g_include_root_count++;
+        } else if (!root) {
+            root = argv[i];
+        } else {
+            fprintf(stderr, "kpp: error: unrecognized argument '%s'\n", argv[i]);
+            return 1;
+        }
+    }
+    if (!root) {
+        fprintf(stderr, "usage: kpp [-Idir ...] <root.kpl>\n");
         return 1;
     }
-    flatten(argv[1]);
+    flatten(root);
     find_blocks();
     scan_all_calls();
     compute_reachability();
