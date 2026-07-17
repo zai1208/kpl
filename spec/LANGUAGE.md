@@ -37,6 +37,29 @@ STRUCT Framebuffer {
 *   **Compilation Rule**: The compiler records the absolute byte offset of each field relative to the start of the structure (`address` = +0, `width` = +8, `height` = +16, `pitch` = +24). 
 *   **Memory Realignment**: Fields are packed tightly using standard 64-bit / 32-bit alignment limits.
 
+### 2.2 Field Access (`->`)
+A variable may be declared with a `STRUCT` name in place of a primitive type. Physically this is identical to a `ptr` (one 8-byte stack slot holding an address) - the struct name only tells the compiler which field table to resolve `->` against. A `STRUCT` field may itself be declared with another `STRUCT`'s name in place of a primitive type, the same way - it is physically an 8-byte pointer field, tagged with which struct's table its own `->` resolves against.
+```kpl
+STRUCT Response {
+    u64 count
+    ptr items
+}
+STRUCT Request {
+    Response response
+}
+
+Request req = some_pointer_value
+u64 n = req->response->count      ; VALID: chains through two structs
+ptr first = req->response->items[0]  ; VALID: literal array index ends the chain
+fb->width = 1920                    ; VALID: writes work the same as reads
+```
+*   **Placement**: `variable->field`, `variable->field->field`, and `variable[N]` / `variable->field[N]` are each a single token (no internal whitespace) and are valid anywhere a plain variable name is valid as an operand - the right-hand side of a declaration or assignment, an `if`/`loop` condition, or a `PROC` call argument.
+*   **Chaining**: `->` may be repeated to walk through any number of nested `STRUCT`-typed fields, e.g. `a->b->c->d`. Each hop must itself have been declared with a `STRUCT` type; chaining onto a primitive field (`u64`/`u32`/`ptr`) is a compile-time error, since there is no field table to resolve the next hop against.
+*   **Array indexing (`[N]`)**: a trailing `[N]` on the base variable or on any field in the chain indexes into what that pointer points to, as an array of pointer-sized (8-byte) elements: `base[N]` reads/writes the value at `base + N*8`. **`N` must be a compile-time integer literal** - there is no variable-index form. `[N]` may only be the *last* step in a chain: the element type of an indexed array isn't tracked, so `arr[0]->field` is a compile-time error, not a silent guess.
+*   **Linearity**: any field-access or index expression counts as one operand, the same as a bare variable name. `u64 w = fb->width` is a flat assignment; combining it with an operator still obeys the one-operator-per-line rule from 3.3 (`u64 total = fb->width + fb->height` is illegal for the same reason `a + b * c` is).
+*   **Scope**: Field access and indexing resolve against local variables only. Neither is available inside `ASM` blocks' `[variable]` substitution (6.3) - that mechanism only matches a bare identifier, not an arrow or bracket expression.
+*   **Unknown fields**: Referencing a field name not defined on the relevant `STRUCT` triggers a compile-time crash, consistent with the rest of the language's approach to undefined identifiers.
+
 ---
 
 ## 3. Variable Management & Linearity Enforcement
@@ -63,6 +86,21 @@ Complex math operations must be explicitly broken across multiple linear steps b
 u64 temp = b * c
 u64 total = a + temp
 ```
+
+### 3.4 Operators
+**Binary** (`a OP b`, one per line, per 3.3): `+` `-` `*` `/` `&` `|` `^` `<<` `>>`. Division and shifts are unsigned - every KPL type is unsigned (2), so `/` is an unsigned divide and `>>` is a logical (zero-filling) shift, never arithmetic/sign-extending.
+```kpl
+u64 masked = flags & 0x0F
+u64 merged = a | b
+u64 toggled = a ^ b
+u64 doubled = x << 1
+u64 halved = x >> 1
+```
+**Unary** (`OP a`, a single operand): `~` (bitwise NOT).
+```kpl
+u64 inverted = ~ flags
+```
+A unary operator requires a space before its operand, the same as every binary operator requires spaces around it (3.3) - `~flags` (no space) is not the same token as `~ flags` and will not parse as the NOT of `flags`.
 
 ---
 
@@ -103,6 +141,26 @@ draw_pixel:
     pop rbp
     ret
 ```
+
+### 4.4 Return Values (`RETURN`)
+A `PROC` may exit early and/or return a value with `RETURN`, in one of two forms:
+```kpl
+PROC add_five(x: u64) {
+    RETURN x + 5    ; computes the expression into RAX, then exits
+}
+
+PROC log_and_exit() {
+    RETURN          ; exits immediately, RAX is whatever it already held
+}
+```
+*   **Value form**: `RETURN <expr>` accepts anything valid as a declaration's right-hand side (3.3) - a single operand, or one `a OP b` expression - and places the result in `RAX`, the System V ABI's return-value register, immediately before the standard epilogue (4.3).
+*   **Void form**: bare `RETURN` runs the epilogue immediately without touching `RAX`. This is the only form available in earlier versions of this spec; the value form is additive.
+*   **Calling a PROC for its value**: a call `identifier(args)` may be used directly as a declaration or assignment's right-hand side:
+    ```kpl
+    u64 result = add_five(10)
+    ```
+    A call used this way is one flat operand - the same tier as a bare variable name - and **cannot** be combined with an operator on the same line. `u64 x = add_five(10) + 1` is a linearity violation (3.3) for the same reason `u64 x = a + b * c` is; write it as two lines instead.
+*   **Falling off the end**: every `PROC`'s closing `}` emits the same epilogue regardless of whether `RETURN` was used. A `PROC` whose callers expect a value but which reaches `}` without an explicit `RETURN <expr>` returns whatever `RAX` happened to hold - this is a real sharp edge, not a checked error, consistent with the rest of the language's minimal, unvalidated approach to control flow.
 
 ---
 
@@ -168,4 +226,5 @@ ASM {
     call clear_screen
 }
 ```
+A `call` written this way is raw, unparsed text - unlike ordinary `identifier(args)` call syntax (4.4), it does not benefit from automatic `extern` declaration (see COMPILER.md 3.2). If the target is defined in a different translation unit, add `extern target_name` as its own line inside the `ASM` block.
 ***

@@ -1,0 +1,16 @@
+INCLUDE "gfx.kpl"
+
+u64 boot_magic = 0x2BADB002
+u32 version = 3
+
+PROC kpl_main() {
+    add_five(boot_magic)
+    classify(version)
+    sum_to(10)
+    ASM {
+        cli
+    .halt:
+        hlt
+        jmp .halt
+    }
+}

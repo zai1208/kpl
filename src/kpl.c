@@ -77,6 +77,7 @@
 #define MAX_LOCALS    256
 #define MAX_GLOBALS   1024
 #define MAX_NEST      128
+#define MAX_CHAIN_HOPS 8
 
 #define TEXT_BUF_SIZE (1 << 20)
 #define DATA_BUF_SIZE (1 << 18)
@@ -110,7 +111,7 @@ static int type_from_str(const char *s, Type *out) {
     return 0;
 }
 
-typedef struct { char name[MAX_NAME_LEN]; Type type; int offset; } StructField;
+typedef struct { char name[MAX_NAME_LEN]; Type type; int offset; int struct_id; } StructField;
 typedef struct {
     char name[MAX_NAME_LEN];
     StructField fields[MAX_FIELDS];
@@ -120,21 +121,56 @@ typedef struct {
 static StructDef g_structs[MAX_STRUCTS];
 static int g_struct_count = 0;
 
+/* Tracks every PROC name defined in this translation unit, and every
+ * name ever used as a call target. At the end, any called name that was
+ * never defined locally gets an `extern` declaration emitted for it, so
+ * KPL code can call hand-written routines (e.g. a kstd driver written
+ * directly in NASM) living in a separate object file. */
+#define MAX_PROCS 2048
+static char g_defined_procs[MAX_PROCS][MAX_NAME_LEN];
+static int  g_defined_proc_count = 0;
+static char g_called_names[MAX_PROCS][MAX_NAME_LEN];
+static int  g_called_name_count = 0;
+
+static int name_in_table(char table[][MAX_NAME_LEN], int count, const char *name) {
+    int i;
+    for (i = 0; i < count; i++) if (strcmp(table[i], name) == 0) return 1;
+    return 0;
+}
+
+static void record_defined_proc(const char *name) {
+    if (name_in_table(g_defined_procs, g_defined_proc_count, name)) return;
+    if (g_defined_proc_count >= MAX_PROCS) return; /* best effort; also caught by MAX_STRUCTS-style limits elsewhere */
+    strncpy(g_defined_procs[g_defined_proc_count], name, MAX_NAME_LEN - 1);
+    g_defined_procs[g_defined_proc_count][MAX_NAME_LEN - 1] = '\0';
+    g_defined_proc_count++;
+}
+
+static void record_called_name(const char *name) {
+    if (name_in_table(g_called_names, g_called_name_count, name)) return;
+    if (g_called_name_count >= MAX_PROCS) return;
+    strncpy(g_called_names[g_called_name_count], name, MAX_NAME_LEN - 1);
+    g_called_names[g_called_name_count][MAX_NAME_LEN - 1] = '\0';
+    g_called_name_count++;
+}
+
 typedef struct { char name[MAX_NAME_LEN]; Type type; } GlobalVar;
 static GlobalVar g_globals[MAX_GLOBALS];
 static int g_global_count = 0;
 
-typedef struct { char name[MAX_NAME_LEN]; Type type; int offset; } LocalVar;
+typedef struct { char name[MAX_NAME_LEN]; Type type; int offset; int struct_id; } LocalVar;
 static LocalVar g_locals[MAX_LOCALS];
 static int g_local_count = 0;
 static int g_frame_size = 0;
 
-typedef enum { OPND_IMM, OPND_REG, OPND_MEM } OperandKind;
+typedef enum { OPND_IMM, OPND_REG, OPND_MEM, OPND_FIELD } OperandKind;
 typedef struct {
     OperandKind kind;
     unsigned long imm;
     char reg[8];
     char memref[64];
+    int hop_offsets[MAX_CHAIN_HOPS]; /* one dereference-and-add per chain hop */
+    int hop_count;
     Type type;
 } Operand;
 
@@ -261,7 +297,23 @@ static int split_commas(char *s, char toks[][MAX_TOK], int maxtoks) {
     return n;
 }
 
-static int is_op_token(const char *s) { return s[0] != '\0' && s[1] == '\0' && strchr("+-*/", s[0]) != NULL; }
+/* Binary operators valid in an `a OP b` expression: the original
+ * arithmetic four, plus bitwise AND/OR/XOR (one instruction each) and
+ * the two shifts (two-character tokens, unlike every other operator
+ * here - `split_ws` still hands them over whole since there's no
+ * whitespace inside "<<"/">>", just like there's none inside any other
+ * operator token). */
+static int is_op_token(const char *s) {
+    if (s[0] != '\0' && s[1] == '\0' && strchr("+-*/&|^", s[0]) != NULL) return 1;
+    if (strcmp(s, "<<") == 0 || strcmp(s, ">>") == 0) return 1;
+    return 0;
+}
+
+/* Prefix unary operators: a genuinely different shape from `a OP b`
+ * (one operand, not two), kept as its own table/dispatch rather than
+ * bolted onto is_op_token/emit_binop, since more unary operators are a
+ * reasonable thing to add later without reshaping this one. */
+static int is_unary_op_token(const char *s) { return strcmp(s, "~") == 0; }
 
 static int parse_int_literal(const char *s, unsigned long *out) {
     if (!*s) return 0;
@@ -364,10 +416,19 @@ static GlobalVar *find_global(const char *name) {
     for (i = 0; i < g_global_count; i++) if (strcmp(g_globals[i].name, name) == 0) return &g_globals[i];
     return NULL;
 }
+static int find_struct_index(const char *name) {
+    int i;
+    for (i = 0; i < g_struct_count; i++) if (strcmp(g_structs[i].name, name) == 0) return i;
+    return -1;
+}
 
 /* Allocates a stack slot for a local/param, packing tightly but aligned
- * to its own size (same scheme as STRUCT field layout, spec 2.1). */
-static int alloc_local(const char *name, Type ty) {
+ * to its own size (same scheme as STRUCT field layout, spec 2.1).
+ * struct_id is -1 for a plain u64/u32/ptr, or the index into g_structs
+ * if this local was declared with a STRUCT name as its type (physically
+ * still just an 8-byte pointer slot - the tag only exists so `var->field`
+ * knows which struct's field table to resolve against). */
+static int alloc_local(const char *name, Type ty, int struct_id) {
     if (find_local(name)) die_loc("redeclaration of local variable '%s'", name);
     int sz = type_size(ty);
     int off = g_frame_size;
@@ -379,12 +440,35 @@ static int alloc_local(const char *name, Type ty) {
     strncpy(v->name, name, sizeof(v->name) - 1); v->name[sizeof(v->name) - 1] = '\0';
     v->type = ty;
     v->offset = off;
+    v->struct_id = struct_id;
     return off;
 }
 
 /* ------------------------------------------------------------------ */
 /* operand resolution + codegen primitives                            */
 /* ------------------------------------------------------------------ */
+
+/* Strips a trailing "[N]" off `seg` in place (if present), and writes N
+ * to *index_out. N must be a compile-time integer literal - variable
+ * indices aren't supported (see spec/LANGUAGE.md 2.2: why not, and what
+ * it would take). Returns 1 if a bracket suffix was found and consumed. */
+static int split_index_suffix(char *seg, long *index_out) {
+    char *br = strchr(seg, '[');
+    if (!br) return 0;
+    char *end = strchr(br, ']');
+    if (!end || end[1] != '\0') die_loc("malformed array index in '%s'", seg);
+    *br = '\0';
+    char idxbuf[MAX_TOK];
+    size_t len = (size_t)(end - br - 1);
+    if (len >= sizeof idxbuf) len = sizeof idxbuf - 1;
+    memcpy(idxbuf, br + 1, len);
+    idxbuf[len] = '\0';
+    unsigned long v;
+    if (!parse_int_literal(idxbuf, &v))
+        die_loc("array index must be a constant integer literal, got '%s' - variable indices aren't supported", idxbuf);
+    *index_out = (long)v;
+    return 1;
+}
 
 static int resolve_operand(const char *tok, Operand *o) {
     unsigned long v;
@@ -393,6 +477,67 @@ static int resolve_operand(const char *tok, Operand *o) {
         o->kind = OPND_REG;
         strncpy(o->reg, tok, sizeof(o->reg) - 1); o->reg[sizeof(o->reg) - 1] = '\0';
         o->type = TY_U64;
+        return 1;
+    }
+    if (strstr(tok, "->") || strchr(tok, '[')) {
+        char buf[MAX_LINE_LEN];
+        strncpy(buf, tok, sizeof buf - 1); buf[sizeof buf - 1] = '\0';
+
+        o->hop_count = 0;
+        int cur_struct = -1;   /* which STRUCT's field table the *next* "->name" resolves against */
+        int done_indexing = 0; /* a [N] hop was taken - its element type isn't tracked, so no further hops */
+        int hop_index = 0;
+        char *p = buf;
+
+        for (;;) {
+            char *next_arrow = strstr(p, "->");
+            char seg[MAX_NAME_LEN];
+            size_t seglen = next_arrow ? (size_t)(next_arrow - p) : strlen(p);
+            if (seglen == 0 || seglen >= sizeof seg) return 0;
+            memcpy(seg, p, seglen); seg[seglen] = '\0';
+
+            long idx = 0;
+            int has_index = split_index_suffix(seg, &idx);
+
+            if (hop_index == 0) {
+                /* base: must already be a declared local (any type - a
+                 * bare ptr local can be indexed with [N] without ever
+                 * having been declared with a STRUCT type). */
+                LocalVar *lv = find_local(seg);
+                if (!lv) return 0; /* let the caller report "unknown identifier" */
+                snprintf(o->memref, sizeof(o->memref), "[rbp-%d]", lv->offset);
+                cur_struct = lv->struct_id;
+                o->type = lv->type;
+            } else {
+                if (done_indexing) die_loc("cannot chain '->' after a '[...]' index in '%s' (its element type isn't tracked)", tok);
+                if (cur_struct < 0) die_loc("cannot chain '->%s' in '%s' - the preceding field isn't a STRUCT-typed field", seg, tok);
+                StructDef *sd = &g_structs[cur_struct];
+                int fi;
+                for (fi = 0; fi < sd->field_count; fi++) if (strcmp(sd->fields[fi].name, seg) == 0) break;
+                if (fi == sd->field_count) die_loc("STRUCT '%s' has no field '%s'", sd->name, seg);
+                if (o->hop_count >= MAX_CHAIN_HOPS) die_loc("field chain too deep in '%s' (limit %d)", tok, MAX_CHAIN_HOPS);
+                o->hop_offsets[o->hop_count++] = sd->fields[fi].offset;
+                o->type = sd->fields[fi].type;
+                cur_struct = sd->fields[fi].struct_id;
+            }
+
+            if (has_index) {
+                if (done_indexing) die_loc("cannot chain '[...]' after a '[...]' index in '%s'", tok);
+                if (o->hop_count >= MAX_CHAIN_HOPS) die_loc("field chain too deep in '%s' (limit %d)", tok, MAX_CHAIN_HOPS);
+                o->hop_offsets[o->hop_count++] = (int)(idx * 8); /* [N] always indexes pointer-width elements */
+                o->type = TY_PTR;
+                cur_struct = -1;
+                done_indexing = 1;
+            }
+
+            hop_index++;
+            if (!next_arrow) break;
+            if (done_indexing) die_loc("cannot chain '->' after a '[...]' index in '%s' (its element type isn't tracked)", tok);
+            p = next_arrow + 2;
+        }
+
+        if (o->hop_count == 0) return 0; /* bare "var" with no "->field" or "[N]" - not our concern */
+        o->kind = OPND_FIELD;
         return 1;
     }
     LocalVar *lv = find_local(tok);
@@ -414,7 +559,16 @@ static int resolve_operand(const char *tok, Operand *o) {
 
 /* Loads operand `o` into 64-bit register `dst64`, skipping the move if
  * it's already there. u32 memory/immediate values naturally zero-extend
- * the upper 32 bits of the destination on x86-64. */
+ * the upper 32 bits of the destination on x86-64.
+ *
+ * OPND_FIELD (var->field, var->a->b, var[N], ...) is a chain of one or
+ * more dereferences: the variable's own slot holds a *pointer*, loaded
+ * first into a fixed scratch register (r11, never used as a dst64/
+ * ARG_REG/binop register elsewhere in this compiler, so this never
+ * collides with dst64), then each hop but the last re-dereferences r11
+ * through it; the last hop reads into dst64. A single-hop chain (the
+ * common case, `var->field`) degenerates to exactly the two instructions
+ * this always emitted before chains existed. */
 static void emit_load(const char *dst64, Operand *o) {
     switch (o->kind) {
     case OPND_IMM:
@@ -427,36 +581,78 @@ static void emit_load(const char *dst64, Operand *o) {
         if (o->type == TY_U32) body_emit("    mov %s, %s\n", reg32_of(dst64), o->memref);
         else body_emit("    mov %s, %s\n", dst64, o->memref);
         break;
+    case OPND_FIELD: {
+        body_emit("    mov r11, %s\n", o->memref);
+        int hi;
+        for (hi = 0; hi < o->hop_count - 1; hi++)
+            body_emit("    mov r11, [r11+%d]\n", o->hop_offsets[hi]);
+        int last = o->hop_offsets[o->hop_count - 1];
+        if (o->type == TY_U32) body_emit("    mov %s, [r11+%d]\n", reg32_of(dst64), last);
+        else body_emit("    mov %s, [r11+%d]\n", dst64, last);
+        break;
+    }
     }
 }
 
-/* Stores 64-bit register `src64` into operand `dst` (a variable or a
- * bare register target). */
+/* Stores 64-bit register `src64` into operand `dst` (a variable, a bare
+ * register target, or a var->field / var->a->b / var[N] chain). Never
+ * called with src64 == "r11" (see emit_load) so the chain-walking
+ * scratch load can't clobber the value being stored. */
 static void emit_store(const char *src64, Operand *dst) {
     if (dst->kind == OPND_REG) {
         if (strcmp(dst->reg, src64) != 0) body_emit("    mov %s, %s\n", dst->reg, src64);
     } else if (dst->kind == OPND_MEM) {
         if (dst->type == TY_U32) body_emit("    mov %s, %s\n", dst->memref, reg32_of(src64));
         else body_emit("    mov %s, %s\n", dst->memref, src64);
+    } else if (dst->kind == OPND_FIELD) {
+        body_emit("    mov r11, %s\n", dst->memref);
+        int hi;
+        for (hi = 0; hi < dst->hop_count - 1; hi++)
+            body_emit("    mov r11, [r11+%d]\n", dst->hop_offsets[hi]);
+        int last = dst->hop_offsets[dst->hop_count - 1];
+        if (dst->type == TY_U32) body_emit("    mov [r11+%d], %s\n", last, reg32_of(src64));
+        else body_emit("    mov [r11+%d], %s\n", last, src64);
     } else {
         die_loc("cannot assign to a constant");
     }
 }
 
-/* rax <- rax OP b (b staged through rbx first for uniform, always-correct
- * codegen - this is a deterministic simple compiler, not an optimizer). */
-static void emit_binop(char op, Operand *b) {
+/* rax <- rax OP b. b is staged through a register first for uniform,
+ * always-correct codegen (this is a deterministic simple compiler, not
+ * an optimizer - an immediate-operand form of `shl`/`add`/etc would be
+ * one instruction shorter, but every operator here already forgoes that
+ * for the same reason). Shifts stage their operand into RCX instead of
+ * RBX because x86-64 only supports a variable shift count through CL -
+ * `shl reg, reg` isn't a real instruction, `shl reg, cl` is. */
+static void emit_binop(const char *op, Operand *b) {
+    if (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0) {
+        emit_load("rcx", b);
+        if (strcmp(op, "<<") == 0) body_emit("    shl rax, cl\n");
+        else body_emit("    shr rax, cl\n"); /* logical shift: every KPL type is unsigned */
+        return;
+    }
     emit_load("rbx", b);
-    switch (op) {
-    case '+': body_emit("    add rax, rbx\n"); break;
-    case '-': body_emit("    sub rax, rbx\n"); break;
-    case '*': body_emit("    imul rax, rbx\n"); break;
-    case '/':
+    if (strcmp(op, "+") == 0) body_emit("    add rax, rbx\n");
+    else if (strcmp(op, "-") == 0) body_emit("    sub rax, rbx\n");
+    else if (strcmp(op, "*") == 0) body_emit("    imul rax, rbx\n");
+    else if (strcmp(op, "/") == 0) {
         body_emit("    xor rdx, rdx\n");
         body_emit("    div rbx\n"); /* unsigned division: every KPL type is unsigned */
-        break;
-    default: die_loc("unknown operator '%c'", op);
     }
+    else if (strcmp(op, "&") == 0) body_emit("    and rax, rbx\n");
+    else if (strcmp(op, "|") == 0) body_emit("    or rax, rbx\n");
+    else if (strcmp(op, "^") == 0) body_emit("    xor rax, rbx\n");
+    else die_loc("unknown operator '%s'", op);
+}
+
+/* rax <- OP a. Deliberately its own function rather than a special case
+ * inside emit_binop: unary operators are a different shape (one operand,
+ * not two) and this is where the next one goes, not into emit_binop's
+ * switch. */
+static void emit_unary_op(const char *op, Operand *a) {
+    emit_load("rax", a);
+    if (strcmp(op, "~") == 0) body_emit("    not rax\n");
+    else die_loc("unknown unary operator '%s'", op);
 }
 
 /* cmp lhs, rhs ; <inverse-condition> jump_target  (spec 5.2 / 3.4) */
@@ -601,58 +797,28 @@ static void handle_loop(char *line) {
 /* declarations / assignments / calls                                 */
 /* ------------------------------------------------------------------ */
 
-static void emit_rhs_into(Operand *dst, char *rhs) {
-    char toks[3][MAX_TOK];
-    int n = split_ws(rhs, toks, 3);
-    if (n == 1) {
-        Operand src;
-        if (!resolve_operand(toks[0], &src)) die_loc("unknown identifier '%s'", toks[0]);
-        emit_load("rax", &src);
-        emit_store("rax", dst);
-    } else if (n == 3 && is_op_token(toks[1])) {
-        Operand a, b;
-        if (!resolve_operand(toks[0], &a)) die_loc("unknown identifier '%s'", toks[0]);
-        if (!resolve_operand(toks[2], &b)) die_loc("unknown identifier '%s'", toks[2]);
-        emit_load("rax", &a);
-        emit_binop(toks[1][0], &b);
-        emit_store("rax", dst);
-    } else {
-        die_loc("expression violates the linearity constraint (max one operator per line): '%s'", rhs);
-    }
+/* True if `rhs` is exactly `identifier(args)` with nothing else around
+ * it - i.e. a call used as an expression, not a call statement. */
+static int looks_like_call(const char *rhs) {
+    const char *op = strchr(rhs, '(');
+    if (!op || op == rhs) return 0;
+    size_t len = strlen(rhs);
+    if (len == 0 || rhs[len - 1] != ')') return 0;
+    const char *p = rhs;
+    for (; p < op; p++) if (!is_ident_char((unsigned char)*p)) return 0;
+    return 1;
 }
 
-static void handle_decl_or_assign(char *line) {
-    char *eq = strchr(line, '=');
-    if (!eq) die_loc("expected '=' in statement: %s", line);
-    *eq = '\0';
-    char *lhs = trim(line);
-    char *rhs = trim(eq + 1);
-
-    char toks[3][MAX_TOK];
-    int n = split_ws(lhs, toks, 3);
-
-    Operand dst;
-    if (n == 2) {
-        Type ty;
-        if (!type_from_str(toks[0], &ty)) die_loc("unknown type '%s'", toks[0]);
-        int off = alloc_local(toks[1], ty);
-        dst.kind = OPND_MEM;
-        snprintf(dst.memref, sizeof dst.memref, "[rbp-%d]", off);
-        dst.type = ty;
-    } else if (n == 1) {
-        if (!resolve_operand(toks[0], &dst) || dst.kind == OPND_IMM)
-            die_loc("assignment to unknown identifier '%s'", toks[0]);
-    } else {
-        die_loc("malformed declaration/assignment: %s", lhs);
-    }
-
-    emit_rhs_into(&dst, rhs);
-}
-
-static void handle_call(char *line) {
+/* Emits a call to `line`, which must look like `identifier(args)` -
+ * loading up to 6 arguments into their ABI registers and calling it.
+ * Used both as a full statement (result discarded) and as the RHS of a
+ * declaration/assignment/RETURN (result read from rax by the caller,
+ * per the System V ABI - the same convention every call this compiler
+ * emits already relies on for its own PROC prologues/epilogues). */
+static void emit_call(char *line) {
     char *op = strchr(line, '(');
     char *cp = strrchr(line, ')');
-    if (!op || !cp || cp < op) die_loc("malformed call statement: %s", line);
+    if (!op || !cp || cp < op) die_loc("malformed call: %s", line);
 
     char name[MAX_NAME_LEN];
     size_t nlen = (size_t)(op - line);
@@ -678,7 +844,82 @@ static void handle_call(char *line) {
         if (!resolve_operand(a, &o)) die_loc("unknown identifier '%s' in call to '%s'", a, tname);
         emit_load(ARG_REGS[i], &o);
     }
+    record_called_name(tname);
     body_emit("    call %s\n", tname);
+}
+
+/* Computes a linear expression (a single operand, `a OP b`, or a call
+ * `name(args)`) into rax. Shared by declarations/assignments (which then
+ * store rax into a destination) and RETURN (which leaves it in rax for
+ * the epilogue - the System V ABI's own return-value register, so no
+ * extra move is needed). A call-expression is treated as one flat
+ * operand, the same tier as a bare variable name - `u64 x = f() + 1` is
+ * not supported any more than `u64 x = a + b * c` is; split it into two
+ * lines, same as any other linearity violation. */
+static void emit_rhs_to_rax(char *rhs) {
+    if (looks_like_call(rhs)) {
+        emit_call(rhs);
+        return;
+    }
+    char toks[3][MAX_TOK];
+    int n = split_ws(rhs, toks, 3);
+    if (n == 1) {
+        if (toks[0][0] == '~' && toks[0][1] != '\0')
+            die_loc("unary operator '~' needs a space before its operand: '~ %s'", toks[0] + 1);
+        Operand src;
+        if (!resolve_operand(toks[0], &src)) die_loc("unknown identifier '%s'", toks[0]);
+        emit_load("rax", &src);
+    } else if (n == 2 && is_unary_op_token(toks[0])) {
+        Operand a;
+        if (!resolve_operand(toks[1], &a)) die_loc("unknown identifier '%s'", toks[1]);
+        emit_unary_op(toks[0], &a);
+    } else if (n == 3 && is_op_token(toks[1])) {
+        Operand a, b;
+        if (!resolve_operand(toks[0], &a)) die_loc("unknown identifier '%s'", toks[0]);
+        if (!resolve_operand(toks[2], &b)) die_loc("unknown identifier '%s'", toks[2]);
+        emit_load("rax", &a);
+        emit_binop(toks[1], &b);
+    } else {
+        die_loc("expression violates the linearity constraint (max one operator per line): '%s'", rhs);
+    }
+}
+
+static void emit_rhs_into(Operand *dst, char *rhs) {
+    emit_rhs_to_rax(rhs);
+    emit_store("rax", dst);
+}
+
+static void handle_decl_or_assign(char *line) {
+    char *eq = strchr(line, '=');
+    if (!eq) die_loc("expected '=' in statement: %s", line);
+    *eq = '\0';
+    char *lhs = trim(line);
+    char *rhs = trim(eq + 1);
+
+    char toks[3][MAX_TOK];
+    int n = split_ws(lhs, toks, 3);
+
+    Operand dst;
+    if (n == 2) {
+        Type ty;
+        int struct_id = -1;
+        if (!type_from_str(toks[0], &ty)) {
+            struct_id = find_struct_index(toks[0]);
+            if (struct_id < 0) die_loc("unknown type '%s'", toks[0]);
+            ty = TY_PTR; /* a "StructName var" local is physically just a pointer */
+        }
+        int off = alloc_local(toks[1], ty, struct_id);
+        dst.kind = OPND_MEM;
+        snprintf(dst.memref, sizeof dst.memref, "[rbp-%d]", off);
+        dst.type = ty;
+    } else if (n == 1) {
+        if (!resolve_operand(toks[0], &dst) || dst.kind == OPND_IMM)
+            die_loc("assignment to unknown identifier '%s'", toks[0]);
+    } else {
+        die_loc("malformed declaration/assignment: %s", lhs);
+    }
+
+    emit_rhs_into(&dst, rhs);
 }
 
 /* ------------------------------------------------------------------ */
@@ -737,12 +978,14 @@ static int process_proc_line(char *raw) {
     else if (starts_with_word(line, "loop")) handle_loop(line);
     else if (starts_with_word(line, "ASM")) handle_asm(line);
     else if (starts_with_word(line, "RETURN")) {
+        char *expr = trim(line + 6);
+        if (*expr != '\0') emit_rhs_to_rax(expr);
         body_emit("    mov rsp, rbp\n");
         body_emit("    pop rbp\n");
         body_emit("    ret\n");
     }
     else if (strchr(line, '=')) handle_decl_or_assign(line);
-    else if (strchr(line, '(')) handle_call(line);
+    else if (strchr(line, '(')) emit_call(line);
     else die_loc("unrecognized statement: %s", line);
 
     if (comment[0]) body_emit("    ; %s\n", comment);
@@ -783,7 +1026,12 @@ static void handle_struct(char *line) {
         int n = split_ws(l, toks, 2);
         if (n != 2) die_loc("malformed STRUCT field (expected 'type name'): %s", l);
         Type ty;
-        if (!type_from_str(toks[0], &ty)) die_loc("unknown type '%s' in STRUCT field", toks[0]);
+        int fld_struct_id = -1;
+        if (!type_from_str(toks[0], &ty)) {
+            fld_struct_id = find_struct_index(toks[0]);
+            if (fld_struct_id < 0) die_loc("unknown type '%s' in STRUCT field", toks[0]);
+            ty = TY_PTR; /* a "StructName field" is physically just a pointer, same as locals */
+        }
         int sz = type_size(ty);
         if (offset % sz != 0) offset += sz - (offset % sz);
         if (sd->field_count >= MAX_FIELDS) die_loc("too many fields in STRUCT %s (limit %d)", sd->name, MAX_FIELDS);
@@ -791,6 +1039,7 @@ static void handle_struct(char *line) {
         strncpy(f->name, toks[1], sizeof(f->name) - 1); f->name[sizeof(f->name) - 1] = '\0';
         f->type = ty;
         f->offset = offset;
+        f->struct_id = fld_struct_id;
         offset += sz;
     }
     die_loc("unterminated STRUCT '%s'", name);
@@ -799,6 +1048,7 @@ static void handle_struct(char *line) {
 static void handle_proc(char *line) {
     char name[MAX_NAME_LEN];
     parse_name_after_keyword(line, "PROC", name, sizeof name);
+    record_defined_proc(name);
 
     char anchor_file[MAX_PATH_LEN];
     strncpy(anchor_file, g_cur_file, sizeof anchor_file - 1); anchor_file[sizeof anchor_file - 1] = '\0';
@@ -836,7 +1086,7 @@ static void handle_proc(char *line) {
             char *ptype = trim(colon + 1);
             Type ty;
             if (!type_from_str(ptype, &ty)) die_loc("unknown parameter type '%s'", ptype);
-            int off = alloc_local(pname, ty);
+            int off = alloc_local(pname, ty, -1);
             if (ty == TY_U32) body_emit("    mov [rbp-%d], %s\n", off, reg32_of(ARG_REGS[i]));
             else body_emit("    mov [rbp-%d], %s\n", off, ARG_REGS[i]);
         }
@@ -941,7 +1191,7 @@ static int cmd_init(void) {
         "\n"
         "kpl_kernel.bin: src/main.kpl\n"
         "\t@mkdir -p build\n"
-        "\tkpp src/main.kpl | kpl -o build/kernel.asm\n"
+        "\tkpp -I. src/main.kpl | kpl -o build/kernel.asm\n"
         "\tnasm -f elf64 build/kernel.asm -o build/kernel.o\n"
         "\tld -nostdlib -z max-page-size=0x1000 -T linker.ld build/kernel.o -o kpl_kernel.bin\n"
         "\n"
@@ -980,6 +1230,15 @@ int main(int argc, char **argv) {
 
     FILE *out = outpath ? fopen(outpath, "w") : stdout;
     if (!out) { fprintf(stderr, "kpl: error: cannot open output file '%s'\n", outpath); return 1; }
+
+    int j, wrote_extern = 0;
+    for (j = 0; j < g_called_name_count; j++) {
+        if (!name_in_table(g_defined_procs, g_defined_proc_count, g_called_names[j])) {
+            fprintf(out, "extern %s\n", g_called_names[j]);
+            wrote_extern = 1;
+        }
+    }
+    if (wrote_extern) fprintf(out, "\n");
 
     if (g_text_len > 0) { fprintf(out, "section .text\n\n"); fwrite(g_text_buf, 1, g_text_len, out); }
     if (g_data_len > 0) { fprintf(out, "\nsection .data\n\n"); fwrite(g_data_buf, 1, g_data_len, out); }

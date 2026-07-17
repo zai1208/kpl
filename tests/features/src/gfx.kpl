@@ -1,0 +1,41 @@
+; Framebuffer helpers - exercises STRUCT, PROC params, RETURN, linear
+; expressions, nested if/else, and loop.
+STRUCT Framebuffer {
+    ptr address
+    u64 width
+    u64 height
+    u32 pitch
+}
+
+PROC add_five(x: u64) {
+    u64 result = x + 5
+    RETURN
+}
+
+PROC classify(n: u64) {
+    if n == 0 {
+        u64 zero_flag = 1
+    } else {
+        if n < 10 {
+            u64 small_flag = 1
+        } else {
+            u64 big_flag = 1
+        }
+    }
+}
+
+PROC sum_to(limit: u64) {
+    u64 total = 0
+    u64 i = 0
+    loop i < limit {
+        u64 tmp = total + i
+        total = tmp
+        i = i + 1
+    }
+}
+
+; Never called from kpl_main (directly or transitively) - kpp should
+; tree-shake this away entirely.
+PROC unused_dead_code() {
+    ASM { nop }
+}
