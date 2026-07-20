@@ -164,12 +164,31 @@ static int g_local_count = 0;
 static int g_frame_size = 0;
 
 typedef enum { OPND_IMM, OPND_REG, OPND_MEM, OPND_FIELD } OperandKind;
+
+/* One hop in a field-access/index chain (a->b, a[i], ...). Either a
+ * fixed byte offset known at compile time (a STRUCT field's recorded
+ * offset, or a literal array index pre-multiplied by 8), or a runtime
+ * index - a value that has to be loaded into r10 and used as
+ * [r11 + r10*8], x86-64's native base+index*scale addressing rather
+ * than a separately-computed offset. idx_kind/idx_imm/idx_reg/idx_memref
+ * mirror Operand's own fields, scoped down to exactly the three kinds an
+ * index is allowed to be (never OPND_FIELD - see split_index_suffix). */
+typedef struct {
+    int is_var_index;
+    int offset;              /* valid when !is_var_index */
+    OperandKind idx_kind;    /* valid when is_var_index: OPND_IMM, OPND_REG, or OPND_MEM */
+    unsigned long idx_imm;
+    char idx_reg[8];
+    char idx_memref[64];
+    Type idx_type;
+} ChainHop;
+
 typedef struct {
     OperandKind kind;
     unsigned long imm;
     char reg[8];
     char memref[64];
-    int hop_offsets[MAX_CHAIN_HOPS]; /* one dereference-and-add per chain hop */
+    ChainHop hops[MAX_CHAIN_HOPS];
     int hop_count;
     Type type;
 } Operand;
@@ -452,7 +471,17 @@ static int alloc_local(const char *name, Type ty, int struct_id) {
  * to *index_out. N must be a compile-time integer literal - variable
  * indices aren't supported (see spec/LANGUAGE.md 2.2: why not, and what
  * it would take). Returns 1 if a bracket suffix was found and consumed. */
-static int split_index_suffix(char *seg, long *index_out) {
+/* Forward declaration: split_index_suffix needs to resolve a variable
+ * index as an ordinary operand, and resolve_operand needs
+ * split_index_suffix while walking a chain - mutually recursive. */
+static int resolve_operand(const char *tok, Operand *o);
+
+/* Strips a trailing "[content]" off `seg` in place (if present) and
+ * populates `hop` with either a literal, compile-time-computed offset
+ * (content is a constant integer) or a runtime index (content is a
+ * resolvable operand - a variable, a register, or another literal that
+ * just didn't need staging). Returns 1 if a bracket suffix was found. */
+static int split_index_suffix(char *seg, ChainHop *hop) {
     char *br = strchr(seg, '[');
     if (!br) return 0;
     char *end = strchr(br, ']');
@@ -463,10 +492,27 @@ static int split_index_suffix(char *seg, long *index_out) {
     if (len >= sizeof idxbuf) len = sizeof idxbuf - 1;
     memcpy(idxbuf, br + 1, len);
     idxbuf[len] = '\0';
+
     unsigned long v;
-    if (!parse_int_literal(idxbuf, &v))
-        die_loc("array index must be a constant integer literal, got '%s' - variable indices aren't supported", idxbuf);
-    *index_out = (long)v;
+    if (parse_int_literal(idxbuf, &v)) {
+        /* literal index: the offset is a compile-time constant, exactly
+         * as before - no runtime instructions needed for the index itself */
+        hop->is_var_index = 0;
+        hop->offset = (int)(v * 8); /* [N] always indexes pointer-width elements */
+        return 1;
+    }
+
+    Operand idx;
+    if (!resolve_operand(idxbuf, &idx)) die_loc("unknown identifier '%s' used as array index", idxbuf);
+    if (idx.kind == OPND_FIELD)
+        die_loc("array index '[%s]' cannot itself be a chained field access - compute it into a local first", idxbuf);
+
+    hop->is_var_index = 1;
+    hop->idx_kind = idx.kind;
+    hop->idx_imm = idx.imm;
+    strncpy(hop->idx_reg, idx.reg, sizeof(hop->idx_reg) - 1); hop->idx_reg[sizeof(hop->idx_reg) - 1] = '\0';
+    strncpy(hop->idx_memref, idx.memref, sizeof(hop->idx_memref) - 1); hop->idx_memref[sizeof(hop->idx_memref) - 1] = '\0';
+    hop->idx_type = idx.type;
     return 1;
 }
 
@@ -496,8 +542,8 @@ static int resolve_operand(const char *tok, Operand *o) {
             if (seglen == 0 || seglen >= sizeof seg) return 0;
             memcpy(seg, p, seglen); seg[seglen] = '\0';
 
-            long idx = 0;
-            int has_index = split_index_suffix(seg, &idx);
+            ChainHop idx_hop;
+            int has_index = split_index_suffix(seg, &idx_hop);
 
             if (hop_index == 0) {
                 /* base: must already be a declared local (any type - a
@@ -516,7 +562,9 @@ static int resolve_operand(const char *tok, Operand *o) {
                 for (fi = 0; fi < sd->field_count; fi++) if (strcmp(sd->fields[fi].name, seg) == 0) break;
                 if (fi == sd->field_count) die_loc("STRUCT '%s' has no field '%s'", sd->name, seg);
                 if (o->hop_count >= MAX_CHAIN_HOPS) die_loc("field chain too deep in '%s' (limit %d)", tok, MAX_CHAIN_HOPS);
-                o->hop_offsets[o->hop_count++] = sd->fields[fi].offset;
+                o->hops[o->hop_count].is_var_index = 0;
+                o->hops[o->hop_count].offset = sd->fields[fi].offset;
+                o->hop_count++;
                 o->type = sd->fields[fi].type;
                 cur_struct = sd->fields[fi].struct_id;
             }
@@ -524,7 +572,8 @@ static int resolve_operand(const char *tok, Operand *o) {
             if (has_index) {
                 if (done_indexing) die_loc("cannot chain '[...]' after a '[...]' index in '%s'", tok);
                 if (o->hop_count >= MAX_CHAIN_HOPS) die_loc("field chain too deep in '%s' (limit %d)", tok, MAX_CHAIN_HOPS);
-                o->hop_offsets[o->hop_count++] = (int)(idx * 8); /* [N] always indexes pointer-width elements */
+                o->hops[o->hop_count] = idx_hop;
+                o->hop_count++;
                 o->type = TY_PTR;
                 cur_struct = -1;
                 done_indexing = 1;
@@ -557,18 +606,64 @@ static int resolve_operand(const char *tok, Operand *o) {
     return 0;
 }
 
+/* Stages a variable-index hop's index value into r10 - the fixed,
+ * reserved scratch register for chain indices, exactly as r11 is the
+ * fixed scratch for the pointer being walked. Never collides with r11
+ * or with any dst64/ARG_REG/binop register used elsewhere. */
+static void emit_load_index_to_r10(ChainHop *hop) {
+    switch (hop->idx_kind) {
+    case OPND_IMM: body_emit("    mov r10, %lu\n", hop->idx_imm); break;
+    case OPND_REG: body_emit("    mov r10, %s\n", hop->idx_reg); break;
+    case OPND_MEM:
+        if (hop->idx_type == TY_U32) body_emit("    mov %s, %s\n", reg32_of("r10"), hop->idx_memref);
+        else body_emit("    mov r10, %s\n", hop->idx_memref);
+        break;
+    default: die_loc("internal error: invalid index operand kind");
+    }
+}
+
+/* Emits one hop of a chain, dereferencing r11 (a fixed offset, or
+ * [r11 + r10*8] for a runtime index) and either re-loading r11 (an
+ * intermediate hop) or reading/writing `reg` at the given width (the
+ * final hop). `is_write` selects the direction; `reg` is the value
+ * register either way (source for a write, destination for a read). */
+static void emit_hop_deref(ChainHop *hop, int is_last, const char *reg, Type type, int is_write) {
+    char addr[24];
+    if (hop->is_var_index) {
+        emit_load_index_to_r10(hop);
+        strcpy(addr, "r11+r10*8");
+    } else {
+        snprintf(addr, sizeof addr, "r11+%d", hop->offset);
+    }
+    if (!is_last) {
+        body_emit("    mov r11, [%s]\n", addr);
+        return;
+    }
+    if (is_write) {
+        if (type == TY_U32) body_emit("    mov [%s], %s\n", addr, reg32_of(reg));
+        else body_emit("    mov [%s], %s\n", addr, reg);
+    } else {
+        if (type == TY_U32) body_emit("    mov %s, [%s]\n", reg32_of(reg), addr);
+        else body_emit("    mov %s, [%s]\n", reg, addr);
+    }
+}
+
 /* Loads operand `o` into 64-bit register `dst64`, skipping the move if
  * it's already there. u32 memory/immediate values naturally zero-extend
  * the upper 32 bits of the destination on x86-64.
  *
- * OPND_FIELD (var->field, var->a->b, var[N], ...) is a chain of one or
- * more dereferences: the variable's own slot holds a *pointer*, loaded
- * first into a fixed scratch register (r11, never used as a dst64/
- * ARG_REG/binop register elsewhere in this compiler, so this never
+ * OPND_FIELD (var->field, var->a->b, var[N], var[i], ...) is a chain of
+ * one or more dereferences: the variable's own slot holds a *pointer*,
+ * loaded first into a fixed scratch register (r11, never used as a
+ * dst64/ARG_REG/binop register elsewhere in this compiler, so this never
  * collides with dst64), then each hop but the last re-dereferences r11
  * through it; the last hop reads into dst64. A single-hop chain (the
  * common case, `var->field`) degenerates to exactly the two instructions
- * this always emitted before chains existed. */
+ * this always emitted before chains existed. A runtime-indexed hop
+ * (`var[i]` for a variable `i`, as opposed to a literal) additionally
+ * stages `i` into r10 first and dereferences through x86-64's native
+ * base+index*8 addressing - two instructions for that hop instead of
+ * one, never more, and the shape never depends on what surrounds it. */
 static void emit_load(const char *dst64, Operand *o) {
     switch (o->kind) {
     case OPND_IMM:
@@ -584,20 +679,17 @@ static void emit_load(const char *dst64, Operand *o) {
     case OPND_FIELD: {
         body_emit("    mov r11, %s\n", o->memref);
         int hi;
-        for (hi = 0; hi < o->hop_count - 1; hi++)
-            body_emit("    mov r11, [r11+%d]\n", o->hop_offsets[hi]);
-        int last = o->hop_offsets[o->hop_count - 1];
-        if (o->type == TY_U32) body_emit("    mov %s, [r11+%d]\n", reg32_of(dst64), last);
-        else body_emit("    mov %s, [r11+%d]\n", dst64, last);
+        for (hi = 0; hi < o->hop_count; hi++)
+            emit_hop_deref(&o->hops[hi], hi == o->hop_count - 1, dst64, o->type, 0);
         break;
     }
     }
 }
 
 /* Stores 64-bit register `src64` into operand `dst` (a variable, a bare
- * register target, or a var->field / var->a->b / var[N] chain). Never
- * called with src64 == "r11" (see emit_load) so the chain-walking
- * scratch load can't clobber the value being stored. */
+ * register target, or a var->field / var->a->b / var[N] / var[i] chain).
+ * Never called with src64 == "r11"/"r10" (see emit_load) so the
+ * chain-walking scratch loads can't clobber the value being stored. */
 static void emit_store(const char *src64, Operand *dst) {
     if (dst->kind == OPND_REG) {
         if (strcmp(dst->reg, src64) != 0) body_emit("    mov %s, %s\n", dst->reg, src64);
@@ -607,11 +699,8 @@ static void emit_store(const char *src64, Operand *dst) {
     } else if (dst->kind == OPND_FIELD) {
         body_emit("    mov r11, %s\n", dst->memref);
         int hi;
-        for (hi = 0; hi < dst->hop_count - 1; hi++)
-            body_emit("    mov r11, [r11+%d]\n", dst->hop_offsets[hi]);
-        int last = dst->hop_offsets[dst->hop_count - 1];
-        if (dst->type == TY_U32) body_emit("    mov [r11+%d], %s\n", last, reg32_of(src64));
-        else body_emit("    mov [r11+%d], %s\n", last, src64);
+        for (hi = 0; hi < dst->hop_count; hi++)
+            emit_hop_deref(&dst->hops[hi], hi == dst->hop_count - 1, src64, dst->type, 1);
     } else {
         die_loc("cannot assign to a constant");
     }

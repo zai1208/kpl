@@ -51,11 +51,13 @@ STRUCT Request {
 Request req = some_pointer_value
 u64 n = req->response->count      ; VALID: chains through two structs
 ptr first = req->response->items[0]  ; VALID: literal array index ends the chain
+u64 idx = 2
+ptr third = req->response->items[idx]  ; VALID: variable index, same rules
 fb->width = 1920                    ; VALID: writes work the same as reads
 ```
 *   **Placement**: `variable->field`, `variable->field->field`, and `variable[N]` / `variable->field[N]` are each a single token (no internal whitespace) and are valid anywhere a plain variable name is valid as an operand - the right-hand side of a declaration or assignment, an `if`/`loop` condition, or a `PROC` call argument.
 *   **Chaining**: `->` may be repeated to walk through any number of nested `STRUCT`-typed fields, e.g. `a->b->c->d`. Each hop must itself have been declared with a `STRUCT` type; chaining onto a primitive field (`u64`/`u32`/`ptr`) is a compile-time error, since there is no field table to resolve the next hop against.
-*   **Array indexing (`[N]`)**: a trailing `[N]` on the base variable or on any field in the chain indexes into what that pointer points to, as an array of pointer-sized (8-byte) elements: `base[N]` reads/writes the value at `base + N*8`. **`N` must be a compile-time integer literal** - there is no variable-index form. `[N]` may only be the *last* step in a chain: the element type of an indexed array isn't tracked, so `arr[0]->field` is a compile-time error, not a silent guess.
+*   **Array indexing (`[N]`)**: a trailing `[N]` on the base variable or on any field in the chain indexes into what that pointer points to, as an array of pointer-sized (8-byte) elements: `base[N]` reads/writes the value at `base + N*8`. `N` may be a compile-time integer literal *or* any single resolvable operand (a variable, a register) - it may **not** itself be a `->`/`[...]` chain (`arr[obj->count]` is rejected; compute the index into a local first, `u64 idx = obj->count` then `arr[idx]`). `[N]` may only be the *last* step in a chain: the element type of an indexed array isn't tracked, so `arr[0]->field` is a compile-time error, not a silent guess.
 *   **Linearity**: any field-access or index expression counts as one operand, the same as a bare variable name. `u64 w = fb->width` is a flat assignment; combining it with an operator still obeys the one-operator-per-line rule from 3.3 (`u64 total = fb->width + fb->height` is illegal for the same reason `a + b * c` is).
 *   **Scope**: Field access and indexing resolve against local variables only. Neither is available inside `ASM` blocks' `[variable]` substitution (6.3) - that mechanism only matches a bare identifier, not an arrow or bracket expression.
 *   **Unknown fields**: Referencing a field name not defined on the relevant `STRUCT` triggers a compile-time crash, consistent with the rest of the language's approach to undefined identifiers.

@@ -414,8 +414,9 @@ else
     pass "kpl: chaining '->' past a '[...]' index correctly rejected"
 fi
 
-# a variable (non-literal) array index must be rejected
-cat > "$WORK/chain/bad2.kpl" <<'EOF'
+# variable (non-literal) array indices are now supported: codegen shape
+# check first (fast, no boot needed)
+cat > "$WORK/chain/varidx.kpl" <<'EOF'
 STRUCT Foo {
     ptr items
 }
@@ -423,12 +424,137 @@ PROC kpl_main() {
     Foo f = 0
     u64 i = 2
     ptr x = f->items[i]
+    f->items[i] = 42
 }
 EOF
-if "$KPP" "$WORK/chain/bad2.kpl" | "$KPL" -o "$WORK/chain/bad2.asm" 2>/dev/null; then
-    fail "kpl: variable array index was NOT rejected"
+if "$KPP" "$WORK/chain/varidx.kpl" | "$KPL" -o "$WORK/chain/varidx.asm" 2>/dev/null \
+    && grep -q "mov r10, \[rbp" "$WORK/chain/varidx.asm" \
+    && grep -q "\[r11+r10\*8\]" "$WORK/chain/varidx.asm" \
+    && nasm -f elf64 "$WORK/chain/varidx.asm" -o "$WORK/chain/varidx.o" 2>/dev/null
+then
+    pass "kpl: variable array index compiles to base+index*8 addressing"
 else
-    pass "kpl: variable array index correctly rejected"
+    fail "kpl: variable array index codegen wrong or failed to assemble"
+fi
+
+# ...and boot-verified: read all four elements of a real array through a
+# runtime `loop` counter (not a literal), then write through a variable
+# index and read the write back - this is the exact shape page-table
+# code needs, so it gets the same rigor as the bitwise operators did.
+if command -v qemu-system-x86_64 >/dev/null 2>&1 && command -v grub-mkrescue >/dev/null 2>&1; then
+    vi="$WORK/varidx_boot"
+    mkdir -p "$vi/isodir/boot/grub"
+    cat > "$vi/array_data.asm" <<'EOF'
+section .data
+align 8
+test_array:
+    dq 10
+    dq 20
+    dq 30
+    dq 40
+
+section .text
+global get_test_array
+get_test_array:
+    lea rax, [test_array]
+    ret
+EOF
+    cat > "$vi/t.kpl" <<'EOF'
+PROC serial_init() {
+    ASM {
+        mov dx, 0x3F9
+        mov al, 0x00
+        out dx, al
+        mov dx, 0x3FB
+        mov al, 0x80
+        out dx, al
+        mov dx, 0x3F8
+        mov al, 0x03
+        out dx, al
+        mov dx, 0x3F9
+        mov al, 0x00
+        out dx, al
+        mov dx, 0x3FB
+        mov al, 0x03
+        out dx, al
+        mov dx, 0x3FA
+        mov al, 0xC7
+        out dx, al
+        mov dx, 0x3FC
+        mov al, 0x0B
+        out dx, al
+    }
+}
+PROC serial_putc(ch: u64) {
+    ASM {
+    .wait:
+        mov dx, 0x3FD
+        in al, dx
+        test al, 0x20
+        jz .wait
+        mov al, [ch]
+        mov dx, 0x3F8
+        out dx, al
+    }
+}
+PROC kpl_main() {
+    serial_init()
+    ptr arr = get_test_array()
+
+    ; read all four elements through a real runtime loop counter
+    u64 i = 0
+    loop i < 4 {
+        u64 val = arr[i]
+        serial_putc(val)
+        i = i + 1
+    }
+
+    ; write through a variable index, then read that same index back
+    u64 widx = 2
+    arr[widx] = 99
+    u64 readback = arr[widx]
+    serial_putc(readback)
+
+    ASM {
+        cli
+    .halt:
+        hlt
+        jmp .halt
+    }
+}
+EOF
+    if "$KPP" "$vi/t.kpl" | "$KPL" -o "$vi/kernel.asm" 2>/dev/null \
+        && nasm -f elf64 "$ROOT/tests/hello_boot/boot32.asm" -o "$vi/boot32.o" 2>/dev/null \
+        && nasm -f elf64 "$vi/array_data.asm" -o "$vi/array_data.o" 2>/dev/null \
+        && nasm -f elf64 "$vi/kernel.asm" -o "$vi/kernel.o" 2>/dev/null \
+        && ld -nostdlib -T "$ROOT/tests/hello_boot/linker.ld" "$vi/boot32.o" "$vi/array_data.o" "$vi/kernel.o" -o "$vi/isodir/boot/kernel.elf" 2>/dev/null
+    then
+        cat > "$vi/isodir/boot/grub/grub.cfg" <<'EOF'
+set timeout=0
+menuentry "varidx" {
+    multiboot2 /boot/kernel.elf
+    boot
+}
+EOF
+        if grub-mkrescue -o "$vi/kernel.iso" "$vi/isodir" >/dev/null 2>&1; then
+            timeout -s KILL 8 qemu-system-x86_64 -cdrom "$vi/kernel.iso" \
+                -serial file:"$vi/serial.log" -display none -no-reboot -m 128M \
+                < /dev/null > /dev/null 2>&1 || true
+            got="$(od -An -tu1 "$vi/serial.log" 2>/dev/null | tr -s ' ')"
+            want=" 10 20 30 40 99"
+            if [ "$got" = "$want" ]; then
+                pass "kpl: variable array index reads/writes the correct element (booted, verified over serial)"
+            else
+                fail "kpl: variable array index runtime result wrong - got '$got', want '$want'"
+            fi
+        else
+            fail "kpl: variable array index boot test grub-mkrescue failed"
+        fi
+    else
+        fail "kpl: variable array index boot test build failed"
+    fi
+else
+    echo "SKIP: variable array index boot verification (qemu-system-x86_64 and/or grub-mkrescue not installed)"
 fi
 
 # Bitwise/shift/unary operators: verify actual computed *results*, not

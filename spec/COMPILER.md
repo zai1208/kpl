@@ -63,7 +63,7 @@ u64 n = req->response->count       ; chained: two hops
 ptr first = req->response->items[0] ; chained, ending in a literal index
 ```
 *   **Resolution**: a field-access/index token is resolved as a sequence of hops, left to right. The first segment (before the first `->`, if any) must be a declared local; each subsequent segment is looked up in the field table of whatever `STRUCT` the previous hop resolved to. A trailing `[N]` on any segment is parsed as a literal integer and contributes one more hop at byte offset `N * 8`, and ends the chain - the compiler does not track an indexed pointer's element type, so a further `->` after `[N]` is rejected at compile time rather than guessed at.
-*   **Code-Generation Pattern**: every hop but the last re-dereferences a single scratch register; the last hop reads into (or writes from) the destination. An *n*-hop chain is always exactly *n* + 1 instructions - one base load, *n* - 1 intermediate dereferences, one final access:
+*   **Code-Generation Pattern**: every hop but the last re-dereferences a single scratch register; the last hop reads into (or writes from) the destination. An *n*-hop chain of fixed offsets (struct fields, literal indices) is always exactly *n* + 1 instructions - one base load, *n* - 1 intermediate dereferences, one final access. Each *variable*-indexed hop (below) adds exactly one more instruction to that count - the index load - never more:
 ```nasm
 ; req->response->items[0]  (three hops: response, items, [0])
 mov r11, [rbp - 8]      ; load req
@@ -72,7 +72,15 @@ mov r11, [r11 + 16]     ; -> items
 mov rax, [r11 + 0]      ; -> [0]
 ```
 A single-hop chain (`fb->width`) is this same pattern with *n* = 1, unchanged from the two-instruction form it has always produced.
-*   **Array index arithmetic happens at compile time.** `N` in `[N]` must be a constant integer literal; the compiler computes `N * 8` itself and emits it as a fixed displacement, exactly like a struct field's offset. There is no runtime multiply, and no variable-index form - `arr[i]` for a variable `i` is rejected, not silently supported with different codegen shape than a literal index would produce.
+*   **Two index forms, deliberately different code shapes.** A literal index (`arr[0]`) is a compile-time constant: the compiler computes `N * 8` itself and emits it as a fixed displacement, exactly like a struct field's offset - no runtime instruction represents the multiply at all. A variable index (`arr[i]`) stages `i` into a second fixed scratch register, `r10` (reserved the same way `r11` is - never a call-argument register, comparison register, or assignment destination), and uses x86-64's native base+index×8 addressing mode to do the multiply-and-add as part of the dereferencing instruction itself, not as a separate `imul`:
+```nasm
+; arr[0]                    ; arr[i]
+mov r11, [rbp - 8]           mov r11, [rbp - 8]
+mov rax, [r11 + 0]           mov r10, [rbp - 16]    ; i
+                              mov rax, [r11 + r10*8]
+```
+A variable-indexed hop is exactly one instruction longer than a literal-indexed hop - the index load - never more, regardless of what the index expression's source (a local, a global, a register) is. The scale is always 8: `[N]`/`[i]` only ever indexes pointer-sized elements (2.2).
+*   **The index itself is one resolvable operand, not a chain.** `arr[i]` resolves `i` with the same operand resolution used everywhere else in the compiler; `arr[obj->count]` is rejected at the point of resolving the index, because a chain result would need its own scratch register and hop-walk before it could be used as an index, and that's additional machinery this compiler doesn't add for a case a temporary variable already covers (`u64 idx = obj->count` then `arr[idx]`).
 *   **Scratch Register**: `r11` is reserved by the compiler as the fixed pointer-dereference scratch register for every hop in a chain. It is never used as a call-argument register, a comparison/binary-operation register, or an assignment destination, so this never collides with surrounding codegen, regardless of chain length.
 *   **Field type width**: the final hop's declared type determines the access width - a `u32` field is moved with the 32-bit register form (e.g. `mov eax, [r11 + 8]`), matching the same width-selection rule primitive `u32` variables already use. A `[N]` index is always pointer-width (8 bytes), since it has no declared type of its own.
 
