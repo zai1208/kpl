@@ -661,6 +661,159 @@ else
     echo "SKIP: bitwise operator boot verification (qemu-system-x86_64 and/or grub-mkrescue not installed)"
 fi
 
+# &/*: not just codegen shape - prove &x really is x's address (a write
+# through *px lands in x itself) and that passing &y to a hand-written
+# routine as an out-parameter genuinely writes back into y's real
+# storage, not a copy.
+if command -v qemu-system-x86_64 >/dev/null 2>&1 && command -v grub-mkrescue >/dev/null 2>&1; then
+    ap="$WORK/addrptr_boot"
+    mkdir -p "$ap/isodir/boot/grub"
+    cat > "$ap/helper.asm" <<'EOF'
+section .text
+global write_via_ptr
+write_via_ptr:      ; rdi = ptr, rsi = val
+    mov [rdi], rsi
+    ret
+EOF
+    cat > "$ap/t.kpl" <<'EOF'
+PROC serial_init() {
+    ASM {
+        mov dx, 0x3F9
+        mov al, 0x00
+        out dx, al
+        mov dx, 0x3FB
+        mov al, 0x80
+        out dx, al
+        mov dx, 0x3F8
+        mov al, 0x03
+        out dx, al
+        mov dx, 0x3F9
+        mov al, 0x00
+        out dx, al
+        mov dx, 0x3FB
+        mov al, 0x03
+        out dx, al
+        mov dx, 0x3FA
+        mov al, 0xC7
+        out dx, al
+        mov dx, 0x3FC
+        mov al, 0x0B
+        out dx, al
+    }
+}
+PROC serial_putc(ch: u64) {
+    ASM {
+    .wait:
+        mov dx, 0x3FD
+        in al, dx
+        test al, 0x20
+        jz .wait
+        mov al, [ch]
+        mov dx, 0x3F8
+        out dx, al
+    }
+}
+PROC kpl_main() {
+    serial_init()
+
+    u64 x = 10
+    ptr px = &x
+    *px = 20
+    u64 via_var = x
+    u64 via_deref = *px
+    serial_putc(via_var)
+    serial_putc(via_deref)
+
+    u64 y = 0
+    write_via_ptr(&y, 77)
+    u64 y_after = y
+    serial_putc(y_after)
+
+    ASM {
+        cli
+    .halt:
+        hlt
+        jmp .halt
+    }
+}
+EOF
+    if "$KPP" "$ap/t.kpl" | "$KPL" -o "$ap/kernel.asm" 2>/dev/null \
+        && nasm -f elf64 "$ROOT/tests/hello_boot/boot32.asm" -o "$ap/boot32.o" 2>/dev/null \
+        && nasm -f elf64 "$ap/helper.asm" -o "$ap/helper.o" 2>/dev/null \
+        && nasm -f elf64 "$ap/kernel.asm" -o "$ap/kernel.o" 2>/dev/null \
+        && ld -nostdlib -T "$ROOT/tests/hello_boot/linker.ld" "$ap/boot32.o" "$ap/helper.o" "$ap/kernel.o" -o "$ap/isodir/boot/kernel.elf" 2>/dev/null
+    then
+        cat > "$ap/isodir/boot/grub/grub.cfg" <<'EOF'
+set timeout=0
+menuentry "addrptr" {
+    multiboot2 /boot/kernel.elf
+    boot
+}
+EOF
+        if grub-mkrescue -o "$ap/kernel.iso" "$ap/isodir" >/dev/null 2>&1; then
+            timeout -s KILL 8 qemu-system-x86_64 -cdrom "$ap/kernel.iso" \
+                -serial file:"$ap/serial.log" -display none -no-reboot -m 128M \
+                < /dev/null > /dev/null 2>&1 || true
+            got="$(od -An -tu1 "$ap/serial.log" 2>/dev/null | tr -s ' ')"
+            want=" 20 20 77"
+            if [ "$got" = "$want" ]; then
+                pass "kpl: &/* address a real variable and write through it correctly (booted, verified over serial)"
+            else
+                fail "kpl: &/* runtime result wrong - got '$got', want '$want'"
+            fi
+        else
+            fail "kpl: &/* boot test grub-mkrescue failed"
+        fi
+    else
+        fail "kpl: &/* boot test build failed"
+    fi
+else
+    echo "SKIP: &/* boot verification (qemu-system-x86_64 and/or grub-mkrescue not installed)"
+fi
+
+# fast (non-boot) checks: & as a call argument, and the two rejection cases
+mkdir -p "$WORK/addrptr"
+cat > "$WORK/addrptr/t.kpl" <<'EOF'
+PROC fill(dst: ptr, val: u64) {
+    ASM { nop }
+}
+PROC kpl_main() {
+    u64 buf = 0
+    fill(&buf, 7)
+}
+EOF
+if "$KPP" "$WORK/addrptr/t.kpl" | "$KPL" -o "$WORK/addrptr/out.asm" 2>/dev/null \
+    && grep -q "lea rdi, \[rbp" "$WORK/addrptr/out.asm" \
+    && nasm -f elf64 "$WORK/addrptr/out.asm" -o "$WORK/addrptr/out.o" 2>/dev/null
+then
+    pass "kpl: &local works as a call argument (lea into the ABI register)"
+else
+    fail "kpl: &local as a call argument failed"
+fi
+
+cat > "$WORK/addrptr/bad1.kpl" <<'EOF'
+PROC kpl_main() {
+    u64 x = 42
+    &x = 5
+}
+EOF
+if "$KPP" "$WORK/addrptr/bad1.kpl" | "$KPL" -o "$WORK/addrptr/bad1.asm" 2>/dev/null; then
+    fail "kpl: '&x = 5' was NOT rejected"
+else
+    pass "kpl: '&x = 5' correctly rejected"
+fi
+
+cat > "$WORK/addrptr/bad2.kpl" <<'EOF'
+PROC kpl_main() {
+    ptr p = &nonexistent
+}
+EOF
+if "$KPP" "$WORK/addrptr/bad2.kpl" | "$KPL" -o "$WORK/addrptr/bad2.asm" 2>/dev/null; then
+    fail "kpl: address of an undeclared name was NOT rejected"
+else
+    pass "kpl: address of an undeclared name correctly rejected"
+fi
+
 if [ "$FAIL" -eq 0 ]; then
     echo "All checks passed."
 else

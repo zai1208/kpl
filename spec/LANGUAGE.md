@@ -104,6 +104,19 @@ u64 inverted = ~ flags
 ```
 A unary operator requires a space before its operand, the same as every binary operator requires spaces around it (3.3) - `~flags` (no space) is not the same token as `~ flags` and will not parse as the NOT of `flags`.
 
+**Address-of (`&`) and dereference (`*`)**: these have a different job from every other operator here - they don't compute a new value from existing values, they move between a variable and the address of its own storage.
+```kpl
+u64 x = 42
+ptr px = &x        ; px now holds the address of x's own storage
+u64 y = *px        ; reads through px: y == 42
+*px = 99            ; writes through px: x itself is now 99
+fill(&x, 7)          ; &x also works as a call argument directly
+```
+*   Unlike every other operator, `&`/`*` accept **either** spelling - `&x` and `& x` are the same token, and likewise for `*`. This is so they work identically wherever an operand can appear, including as a comma-separated call argument (`fill(&x, 7)`), which never goes through the spaced 2-token parsing every other unary operator relies on.
+*   `&identifier` and `*identifier` only accept a plain declared local or global variable name - not a `->`/`[...]` chain. `&fb->width` (the address of a struct field) and `*fb->address` (dereferencing a chain result) aren't supported yet; compute the value into a plain variable first if you need this (`ptr a = fb->address` then `*a`).
+*   `*identifier` always reads/writes a full 8-byte (`u64`) value - the natural width of dereferencing a raw pointer. A narrower access (e.g. a 4-byte hardware register) still needs a hand-written routine taking the address and value as ordinary arguments, the same as before this existed.
+*   `*identifier = expr` is a valid assignment target, following the same linearity rules as any other assignment (3.3). `&identifier` is not - `&x = 5` is a compile-time error, since taking an address produces a value, not a place to store one.
+
 ---
 
 ## 4. System V AMD64 ABI Enforcement (`PROC`)

@@ -172,6 +172,32 @@ mov rax, [rbp - 8]     ; flags
 not rax
 ```
 
+#### 3.3.2 Address-of (`&`) and Dereference (`*`)
+Unlike every other operator, `&`/`*` are recognized inside `resolve_operand` itself, as a prefix on the token, rather than through the 2-token unary dispatch `~` uses. This is a deliberate difference, not an inconsistency: `~` computes a new value from an existing one (load, then transform), while `&`/`*` don't transform a value at all - they resolve to a *different kind of operand* (an address, or a dereferenced location), which is exactly what `resolve_operand` already exists to do for every other kind of operand (a literal, a register, a `->` chain). Recognizing them there, rather than one level up, is what lets both work identically in every position an operand can appear - a declaration's right-hand side, a `RETURN` expression, and a comma-separated call argument alike - without three separate implementations.
+
+```nasm
+; ptr px = &x
+lea rax, [rbp - 8]
+
+; u64 y = *px
+mov r11, [rbp - 16]    ; px
+mov rax, [r11 + 0]
+
+; *px = 99
+mov rax, 99
+mov r11, [rbp - 16]
+mov [r11 + 0], rax
+
+; fill(&x, 7)
+lea rdi, [rbp - 8]
+mov rsi, 7
+call fill
+```
+*   **`&identifier`** compiles to a single `lea`, computing the identifier's own stack (or, for a global, label) address - no dereference at all, since there's nothing to load.
+*   **`*identifier`** is resolved as a single-hop `OPND_FIELD` chain with a fixed offset of `0` - exactly the representation a single-hop `->field` (3.1.1) already uses, since `*ptr` and `ptr->field_at_offset_zero` are the same operation. This is why it reuses the same two-instruction load/store pattern (load the pointer into `r11`, then dereference through it) rather than needing a new code shape.
+*   **Scope**: both accept only a plain local/global identifier, not a `->`/`[...]` chain - `&fb->width` and `*fb->address` are compile-time errors. Extending either to a chain is a reasonable further step (walking the chain's hops, then taking the address of - rather than dereferencing - the final one) but isn't implemented; the intermediate step of computing the chain result into a plain variable covers the same need today.
+*   **Width**: `*identifier` is always 8 bytes (`u64`) - there is no narrower form. Writing a smaller value (e.g. a 4-byte hardware register) still requires a hand-written routine taking the address and value as ordinary `u32`/`u64` arguments.
+
 ### 3.4 Single-Pass Conditionals (`if` / `else`)
 Branch execution uses a localized, runtime label stack instead of an AST.
 ```kpl

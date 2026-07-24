@@ -163,7 +163,7 @@ static LocalVar g_locals[MAX_LOCALS];
 static int g_local_count = 0;
 static int g_frame_size = 0;
 
-typedef enum { OPND_IMM, OPND_REG, OPND_MEM, OPND_FIELD } OperandKind;
+typedef enum { OPND_IMM, OPND_REG, OPND_MEM, OPND_FIELD, OPND_ADDR } OperandKind;
 
 /* One hop in a field-access/index chain (a->b, a[i], ...). Either a
  * fixed byte offset known at compile time (a STRUCT field's recorded
@@ -332,7 +332,7 @@ static int is_op_token(const char *s) {
  * (one operand, not two), kept as its own table/dispatch rather than
  * bolted onto is_op_token/emit_binop, since more unary operators are a
  * reasonable thing to add later without reshaping this one. */
-static int is_unary_op_token(const char *s) { return strcmp(s, "~") == 0; }
+static int is_unary_op_token(const char *s) { return strcmp(s, "~") == 0 || strcmp(s, "&") == 0 || strcmp(s, "*") == 0; }
 
 static int parse_int_literal(const char *s, unsigned long *out) {
     if (!*s) return 0;
@@ -525,6 +525,59 @@ static int resolve_operand(const char *tok, Operand *o) {
         o->type = TY_U64;
         return 1;
     }
+    /* &identifier - the address of a declared local/global's own storage.
+     * Deliberately scoped to a plain identifier, not a ->/[...] chain
+     * (&fb->width, "address of a field", is a reasonable further
+     * extension - held back rather than added silently, same as every
+     * other scope boundary in this compiler). No space is required
+     * between '&' and the name here (unlike the space ~ requires),
+     * since this needs to work as a single token wherever an operand
+     * can appear - including a comma-separated call argument, which
+     * never goes through the 2-token unary dispatch ~ uses. */
+    if (tok[0] == '&' && tok[1] != '\0') {
+        const char *name = tok + 1;
+        while (*name == ' ' || *name == '\t') name++;
+        if (*name == '\0') return 0;
+        LocalVar *lv = find_local(name);
+        if (lv) {
+            o->kind = OPND_ADDR;
+            snprintf(o->memref, sizeof(o->memref), "[rbp-%d]", lv->offset);
+            o->type = TY_PTR;
+            return 1;
+        }
+        GlobalVar *gv = find_global(name);
+        if (gv) {
+            o->kind = OPND_ADDR;
+            snprintf(o->memref, sizeof(o->memref), "[%s]", name);
+            o->type = TY_PTR;
+            return 1;
+        }
+        die_loc("cannot take the address of '%s' - not a declared local or global variable", name);
+    }
+    /* *identifier - dereferences a plain local/global holding a pointer.
+     * Always a fixed u64 (8-byte) width, the natural size of a raw
+     * pointer dereference - a narrower *ptr (for e.g. a 4-byte MMIO
+     * register) still needs a hand-written helper, same as before.
+     * Reuses the exact chain-walking machinery a single-hop `->field`
+     * already uses (hop_count=1, offset=0) rather than inventing a new
+     * representation - *ptr is exactly "dereference with no field
+     * name," not a fundamentally different operation. */
+    if (tok[0] == '*' && tok[1] != '\0') {
+        const char *name = tok + 1;
+        while (*name == ' ' || *name == '\t') name++;
+        if (*name == '\0') return 0;
+        LocalVar *lv = find_local(name);
+        GlobalVar *gv = lv ? NULL : find_global(name);
+        if (!lv && !gv) die_loc("cannot dereference '%s' - not a declared local or global variable", name);
+        o->kind = OPND_FIELD;
+        if (lv) snprintf(o->memref, sizeof(o->memref), "[rbp-%d]", lv->offset);
+        else snprintf(o->memref, sizeof(o->memref), "[%s]", name);
+        o->hop_count = 1;
+        o->hops[0].is_var_index = 0;
+        o->hops[0].offset = 0;
+        o->type = TY_U64;
+        return 1;
+    }
     if (strstr(tok, "->") || strchr(tok, '[')) {
         char buf[MAX_LINE_LEN];
         strncpy(buf, tok, sizeof buf - 1); buf[sizeof buf - 1] = '\0';
@@ -683,6 +736,9 @@ static void emit_load(const char *dst64, Operand *o) {
             emit_hop_deref(&o->hops[hi], hi == o->hop_count - 1, dst64, o->type, 0);
         break;
     }
+    case OPND_ADDR:
+        body_emit("    lea %s, %s\n", dst64, o->memref);
+        break;
     }
 }
 
@@ -702,7 +758,7 @@ static void emit_store(const char *src64, Operand *dst) {
         for (hi = 0; hi < dst->hop_count; hi++)
             emit_hop_deref(&dst->hops[hi], hi == dst->hop_count - 1, src64, dst->type, 1);
     } else {
-        die_loc("cannot assign to a constant");
+        die_loc("cannot assign to a computed value (a literal or an address-of expression)");
     }
 }
 
@@ -959,9 +1015,23 @@ static void emit_rhs_to_rax(char *rhs) {
         if (!resolve_operand(toks[0], &src)) die_loc("unknown identifier '%s'", toks[0]);
         emit_load("rax", &src);
     } else if (n == 2 && is_unary_op_token(toks[0])) {
-        Operand a;
-        if (!resolve_operand(toks[1], &a)) die_loc("unknown identifier '%s'", toks[1]);
-        emit_unary_op(toks[0], &a);
+        if (strcmp(toks[0], "&") == 0 || strcmp(toks[0], "*") == 0) {
+            /* & and * already work with no space too (resolve_operand
+             * parses the prefix directly, so "&x" is a single n==1 token) - this
+             * branch only handles the spaced form "& x"/"* x", by
+             * recombining and letting resolve_operand do the same work
+             * uniformly, rather than duplicating its address/deref logic
+             * here. */
+            char combined[MAX_TOK * 2];
+            snprintf(combined, sizeof combined, "%s%s", toks[0], toks[1]);
+            Operand a;
+            if (!resolve_operand(combined, &a)) die_loc("cannot resolve '%s'", combined);
+            emit_load("rax", &a);
+        } else {
+            Operand a;
+            if (!resolve_operand(toks[1], &a)) die_loc("unknown identifier '%s'", toks[1]);
+            emit_unary_op(toks[0], &a);
+        }
     } else if (n == 3 && is_op_token(toks[1])) {
         Operand a, b;
         if (!resolve_operand(toks[0], &a)) die_loc("unknown identifier '%s'", toks[0]);
@@ -989,7 +1059,19 @@ static void handle_decl_or_assign(char *line) {
     int n = split_ws(lhs, toks, 3);
 
     Operand dst;
-    if (n == 2) {
+    if ((n == 1 && toks[0][0] == '&' && toks[0][1] != '\0') || (n == 2 && strcmp(toks[0], "&") == 0)) {
+        const char *name = (n == 1) ? toks[0] + 1 : toks[1];
+        die_loc("cannot assign to '&%s' - taking an address produces a value, not a storage location", name);
+    } else if (n == 2 && strcmp(toks[0], "*") == 0) {
+        /* *ptr = rhs, spaced form ("*ptr = rhs" with no space is one
+         * token and already falls through resolve_operand via the n==1
+         * branch below - both spellings reach the same OPND_FIELD
+         * write, through the same emit_store path every other
+         * assignment target already uses). */
+        char combined[MAX_TOK * 2];
+        snprintf(combined, sizeof combined, "*%s", toks[1]);
+        if (!resolve_operand(combined, &dst)) die_loc("cannot dereference '%s'", toks[1]);
+    } else if (n == 2) {
         Type ty;
         int struct_id = -1;
         if (!type_from_str(toks[0], &ty)) {
@@ -1002,7 +1084,7 @@ static void handle_decl_or_assign(char *line) {
         snprintf(dst.memref, sizeof dst.memref, "[rbp-%d]", off);
         dst.type = ty;
     } else if (n == 1) {
-        if (!resolve_operand(toks[0], &dst) || dst.kind == OPND_IMM)
+        if (!resolve_operand(toks[0], &dst) || dst.kind == OPND_IMM || dst.kind == OPND_ADDR)
             die_loc("assignment to unknown identifier '%s'", toks[0]);
     } else {
         die_loc("malformed declaration/assignment: %s", lhs);
